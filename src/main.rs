@@ -1,7 +1,13 @@
 #![no_std]
 #![no_main]
 
-use defmt::{info, println};
+mod display_task;
+mod usb_task;
+
+use core::cell::OnceCell;
+use crate::display_task::update_display;
+use crate::usb_task::{get_next_payload, PAYLOAD_SIZE};
+use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -12,22 +18,17 @@ use embassy_stm32::peripherals::{DMA1_CH5, DMA1_CH6, I2C1, USB_OTG_FS};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usb::Driver;
 use embassy_stm32::{bind_interrupts, dma, exti, i2c, usb, Config};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::Timer;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::Builder;
-use embedded_graphics::image::{Image, ImageRaw};
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::Point;
-use embedded_graphics::Drawable;
-use heatshrink::decoder::HeatshrinkDecoder;
-use heatshrink::{Poll, SinkError};
 use ssd1306::mode::{BufferedGraphicsModeAsync, DisplayConfigAsync};
 use ssd1306::prelude::I2CInterface;
 use ssd1306::rotation::DisplayRotation::Rotate0;
 use ssd1306::size::DisplaySize128x64;
 use ssd1306::Ssd1306Async;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 pub type SsdDisplay = Ssd1306Async<
@@ -39,6 +40,8 @@ pub type SsdDisplay = Ssd1306Async<
 // static VIDEO_DATA: &[u8] = include_bytes!("../output.bin");
 
 pub static TIM_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+pub static REQUEST_NEXT_PAYLOAD_SIGNAL: Signal<ThreadModeRawMutex, u64> = Signal::new();
+pub static PAYLOAD_SIGNAL: Signal<ThreadModeRawMutex, ([u8; PAYLOAD_SIZE], usize)> = Signal::new();
 
 bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<I2C1>;
@@ -96,14 +99,14 @@ async fn main(spawner: Spawner) {
     let mut display = display_base.into_buffered_graphics_mode();
     display.init().await.unwrap();
 
-    let mut ep_out_buffer = [0u8; 256];
+    static EP_OUT_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
     let config = usb::Config::default();
     let driver = Driver::new_fs(
         p.USB_OTG_FS,
         Irqs,
         p.PA12,
         p.PA11,
-        &mut ep_out_buffer,
+        EP_OUT_BUFFER.init([0u8; 256]),
         config,
     );
 
@@ -112,140 +115,43 @@ async fn main(spawner: Spawner) {
     config.product = Some("Bad Apple player!");
     config.serial_number = Some("42");
 
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 64];
 
-    let mut state = State::new();
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+
+    static STATE: StaticCell<State> = StaticCell::new();
+    let state = STATE.init(State::new());
     let mut builder = Builder::new(
         driver,
         config,
-        &mut config_descriptor,
-        &mut bos_descriptor,
+        CONFIG_DESCRIPTOR.init([0; 256]),
+        BOS_DESCRIPTOR.init([0; 256]),
         &mut [], // no msos descriptors
-        &mut control_buf,
+        CONTROL_BUF.init([0; 64]),
     );
 
-    let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    static CLASS: StaticCell<CdcAcmClass<Driver<USB_OTG_FS>>> = StaticCell::new();
+
+    let class = CLASS.init(CdcAcmClass::new(&mut builder, state, 64));
     let mut usb = builder.build();
     let usb_fut = usb.run();
 
-    let another_fut = async {
-        loop {
-            class.wait_connection().await;
-            info!("USB active!");
-            let mut handshake_buf = [0u8; 1];
+    let class_init_fut = async {
+        class.wait_connection().await;
+        info!("USB active!");
+        let mut handshake_buf = [0u8; 9];
 
-            if let Ok(1) = class.read_packet(&mut handshake_buf).await {
-                if handshake_buf[0] == 0xAA {
-                    loop {
-                        let mut decoder: HeatshrinkDecoder<10, 4, 128, 1024> =
-                            HeatshrinkDecoder::new();
-
-                        let mut input_buffer = [0u8; 1024];
-
-                        let mut output_buffer = [0u8; 1024];
-                        let mut output_buffer_size = 0;
-
-                        let mut flash_index: u64 = 0;
-                        let start_time = Instant::now();
-                        let mut frame_count = 0;
-                        let frame_duration = Duration::from_micros(31488);
-
-                        get_next_data(&mut class, &mut input_buffer, flash_index).await;
-                        while flash_index < 1482553 {
-                            match decoder.sink(&input_buffer) {
-                                Ok(n) => flash_index += n as u64,
-                                Err(SinkError::Full) => {}
-                                Err(SinkError::Misuse) => panic!("Misuse"),
-                            }
-
-                            loop {
-                                let mut free_space = &mut output_buffer[output_buffer_size..];
-                                if free_space.is_empty() {
-                                    break;
-                                }
-
-                                match decoder.poll(&mut free_space) {
-                                    Ok(Poll::More(n)) => {
-                                        output_buffer_size += n;
-                                        if output_buffer_size == 1024 {
-                                            println!("More");
-
-                                            draw_to_display(
-                                                &output_buffer,
-                                                &mut display,
-                                                start_time,
-                                                &mut frame_count,
-                                                frame_duration,
-                                            )
-                                            .await;
-                                            output_buffer_size = 0;
-                                        }
-                                    }
-                                    Ok(Poll::Empty(n)) => {
-                                        output_buffer_size += n;
-
-                                        if output_buffer_size == 1024 {
-                                            println!("Empty");
-                                            draw_to_display(
-                                                &output_buffer,
-                                                &mut display,
-                                                start_time,
-                                                &mut frame_count,
-                                                frame_duration,
-                                            )
-                                            .await;
-                                            output_buffer_size = 0;
-                                        };
-                                        get_next_data(&mut class, &mut input_buffer, flash_index)
-                                            .await;
-                                        break;
-                                    }
-                                    Err(e) => panic!("Err: {e:?}"),
-                                }
-                            }
-                        }
-                    }
-                }
+        if let Ok(9) = class.read_packet(&mut handshake_buf).await {
+            if handshake_buf[0] == 0xAA {
+                let video_length = u64::from_be_bytes(handshake_buf[1..].try_into().unwrap());
+                spawner.spawn(update_display(display).unwrap());
+                spawner.spawn(get_next_payload(class, video_length).unwrap());
             }
-
-            Timer::after_millis(500).await;
         }
     };
 
-    join(usb_fut, another_fut).await;
-}
-
-async fn get_next_data<'a>(
-    class: &mut CdcAcmClass<'a, Driver<'a, USB_OTG_FS>>,
-    input_buffer: &mut [u8; 1024],
-    mut index: u64,
-) {
-    let mut write_buf = [0u8; 10];
-    'outer: for i in 0..16 {
-        write_buf[0..8].copy_from_slice(&index.to_be_bytes());
-        write_buf[8..10].copy_from_slice(&64u16.to_be_bytes());
-        if class.write_packet(&write_buf).await.is_ok() {
-            let offset = i * 64;
-            loop {
-                match class
-                    .read_packet(&mut input_buffer[offset..offset + 64])
-                    .await
-                {
-                    Ok(bytes) => {
-                        if bytes > 0 {
-                            index += bytes as u64;
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-    }
+    join(usb_fut, class_init_fut).await;
 }
 
 #[embassy_executor::task]
@@ -254,21 +160,4 @@ async fn blink_led(mut led: Output<'static>) -> ! {
         led.toggle();
         Timer::after_secs(1).await;
     }
-}
-
-async fn draw_to_display(
-    buf: &[u8],
-    display: &mut SsdDisplay,
-    start_time: Instant,
-    frame_count: &mut u64,
-    frame_duration: Duration,
-) {
-    info!("Draw!");
-    let next_frame = start_time + (frame_duration * (*frame_count) as u32);
-    *frame_count += 1;
-    let raw = ImageRaw::<BinaryColor>::new(buf, 128);
-    Image::new(&raw, Point::zero()).draw(display).unwrap();
-    display.flush().await.unwrap();
-
-    Timer::at(next_frame).await;
 }

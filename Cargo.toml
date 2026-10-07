@@ -8,6 +8,8 @@ version = "0.1.0"
 
 [profile.dev]
 opt-level = "s"
+lto = "fat"
+codegen-units = 1
 
 [profile.release]
 opt-level = "z"
@@ -23,8 +25,9 @@ defmt = "1.0.1"
 defmt-rtt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 heatshrink-lib = "1.0.0"
+static_cell = { version = "2.1.1" }
 
-ssd1306 = { version = "0.10" , features = ["async", "graphics"]}
+ssd1306 = { version = "0.10", features = ["async", "graphics"] }
 embedded-graphics = "0.8"
 
 embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32f411re", "unstable-pac", "memory-x", "time-driver-any", "exti", "chrono"] }
